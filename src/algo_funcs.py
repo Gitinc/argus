@@ -600,32 +600,26 @@ def compute_optical_flow(prev_img, next_img):
     return skimage.registration.optical_flow_tvl1(prev_img, next_img, attachment=5)
 
 def find_current_mask(point, mask):
-    x, y = point[::-1]
-    
-    height = mask.shape[0]
-    width = mask.shape[1]
-    max_value = -1 
-    
-    for i in range(-3, 4):  # -1, 0, 1 for x-offset
-        for j in range(-3, 4):  # -1, 0, 1 for y-offset
-            current_x = x + i
-            current_y = y + j
-            
-            # Check if the coordinates are within the image boundaries
-            if 0 <= current_x < height and 0 <= current_y < width:
-                pixel_value = mask[int(current_x),int(current_y)]
-            else:
-                pixel_value = -1
-            if int(pixel_value) > max_value:
-                max_value = pixel_value
-                
-    if max_value:
-        curr_mask = (mask == max_value)
+    x, y = map(int, point[::-1])
+    h, w = mask.shape
+
+    # Define window bounds
+    x0 = max(x - 3, 0)
+    x1 = min(x + 4, h)
+    y0 = max(y - 3, 0)
+    y1 = min(y + 4, w)
+
+    # Extract local window
+    window = mask[x0:x1, y0:y1]
+
+    max_value = window.max()
+
+    if max_value > 0:
+        return mask == max_value
     else:
         curr_mask = np.zeros(mask.shape, dtype=bool)
-        curr_mask[int(x),int(y)] = True
-    
-    return curr_mask
+        curr_mask[x, y] = True
+        return curr_mask
 
 def subtract_mean_channel(images, axis=0):
     images_array = np.array(images)
