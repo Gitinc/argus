@@ -2,6 +2,7 @@ import numpy as np
 import os
 import colorsys
 from PIL import Image
+import tifffile
 
 def generate_unique_colors(n_colors):
     """
@@ -76,45 +77,129 @@ def generate_mask(dict_list, n_frames, output_folder):
             combined_mask[t+start_indices[j]][int(all_tracks[j][t][1]),int(all_tracks[j][t][0])] = j+1
             
     return combined_mask
+
+def save_ctc_format(dict_list, tracked_mask, output_dir, digits=3):
+    os.makedirs(output_dir, exist_ok=True)
+
+    T = tracked_mask.shape[0]
+
+    # Cast safely. CTC convention is uint16, but bump to uint32 if needed.
+    max_label = int(tracked_mask.max()) if tracked_mask.size else 0
+    if max_label <= np.iinfo(np.uint16).max:
+        out_dtype = np.uint16
+    else:
+        out_dtype = np.uint32
+
+    # Write per-frame label images
+    for t in range(T):
+        frame = tracked_mask[t].astype(out_dtype, copy=False)
+        fname = os.path.join(output_dir, f"mask{t:0{digits}d}.tif")
+        tifffile.imwrite(fname, frame, compression="zlib")
+
+    # Build res_track.txt
+    # For each track: L = ID+1, B = StartIndex, E = StartIndex + len(Path) - 1, P = 0
+    # Sort by label so the file is tidy.
+    rows = []
+    for entry in dict_list:
+        label = int(entry["ID"]) + 1
+        begin = int(entry["StartIndex"])
+        end = begin + len(entry["Path"]) - 1
+        parent = 0  # no division tracking
+        rows.append((label, begin, end, parent))
+
+    rows.sort(key=lambda r: r[0])
+
+    track_path = os.path.join(output_dir, "res_track.txt")
+    with open(track_path, "w") as f:
+        for label, begin, end, parent in rows:
+            f.write(f"{label} {begin} {end} {parent}\n")
+
+    return track_path
         
-def save_track_data_to_file(dict_list, n_frames, output_folder):
-    #dict_list = [entry for entry in dict_list if len(entry["Path"])>1]
-    
+def _contiguous_runs(frames):
+    """Given a sorted list of frame indices, yield (start, end) inclusive runs."""
+    if not frames:
+        return
+    run_start = prev = frames[0]
+    for t in frames[1:]:
+        if t == prev + 1:
+            prev = t
+            continue
+        yield (run_start, prev)
+        run_start = prev = t
+    yield (run_start, prev)
+
+
+def _parent_old_label(entry):
+    """Return the parent track's old label (ID + 1), or None if no parent.
+
+    Accepts either 'Parent' (refactored tracker) or 'ParentID' (legacy)."""
+    parent_id = entry.get("Parent", entry.get("ParentID"))
+    if parent_id is None:
+        return None
+    return int(parent_id) + 1
+
+
+def save_track_data_to_file(dict_list, tracked_mask, output_folder):
     os.makedirs(output_folder, exist_ok=True)
-    start_indices = [entry["StartIndex"] for entry in dict_list]
-    all_tracks = [entry["Path"] for entry in dict_list]
-    all_ids = [entry["ID"] for entry in dict_list]
+    T = tracked_mask.shape[0]
 
-    combined_mask = generate_mask(dict_list, n_frames, output_folder)
+    # Step 1: per tracker ID, find contiguous runs of frames where it is present.
+    old_label_to_runs = {}
+    for entry in dict_list:
+        old_label = int(entry["ID"]) + 1
+        begin = int(entry["StartIndex"])
+        present = [t for t in range(begin, T) if np.any(tracked_mask[t] == old_label)]
+        runs = list(_contiguous_runs(present))
+        if runs:
+            old_label_to_runs[old_label] = runs
 
-    end_points = np.array(start_indices) + np.array([len(path) for path in all_tracks])
+    # Step 2: assign new CTC labels in (begin, old_label) order.
+    flat = sorted(
+        ((b, old_label, e)
+         for old_label, runs in old_label_to_runs.items()
+         for (b, e) in runs),
+        key=lambda x: (x[0], x[1]),
+    )
+    new_assignments = {}    # (old_label, b, e) -> new_label
+    end_index = {}          # (old_label, end_frame) -> new_label, for parent lookup
+    for new_label, (b, old_label, e) in enumerate(flat, start=1):
+        new_assignments[(old_label, b, e)] = new_label
+        end_index[(old_label, e)] = new_label
 
-    # Open the file in write mode
-    with open(os.path.join(output_folder,"res_track.txt"), 'w') as f:
-        # Iterate through each track in the list
-        for i in range(len(all_tracks)):
-            # L: Unique label for the track (using a 1-based index)
-            # Make sure it is a positive 16-bit value
-            L = i+1
-            
-            # B: Temporal index of the frame in which the track begins
-            B = start_indices[i]
-            
-            # E: Temporal index of the frame in which the track ends
-            E = end_points[i]-1
-            
-            # P: Label of the parent track (always 0 in this case)
-            P = 0
+    # CTC parent convention: a daughter's parent is the run whose final frame
+    # is exactly (daughter_begin - 1). Otherwise 0.
+    def resolve_parent_new_label(daughter_old_label, daughter_begin):
+        entry = old_id_to_entry.get(daughter_old_label)
+        if entry is None:
+            return 0
+        parent_old = _parent_old_label(entry)
+        if parent_old is None:
+            return 0
+        return end_index.get((parent_old, daughter_begin - 1), 0)
 
-            # Write the formatted line to the file
+    old_id_to_entry = {int(entry["ID"]) + 1: entry for entry in dict_list}
+
+    # Step 3: rewrite mask with new labels. uint16 is required for CTC
+    # (uint8 caps at 255 tracks).
+    relabeled = np.zeros((T, *tracked_mask.shape[1:]), dtype=np.uint16)
+    for (old_label, b, e), new_label in new_assignments.items():
+        run = tracked_mask[b:e + 1]
+        relabeled[b:e + 1][run == old_label] = new_label
+
+    # Step 4: write res_track.txt (sorted by new label), with parent lineage.
+    rows = sorted(
+        (new_label, b, e, resolve_parent_new_label(old_label, b))
+        for (old_label, b, e), new_label in new_assignments.items()
+    )
+    with open(os.path.join(output_folder, "res_track.txt"), "w") as f:
+        for L, B, E, P in rows:
             f.write(f"{L} {B} {E} {P}\n")
-                
 
-    for current_image_index, arr in enumerate(combined_mask):
-        arr = arr.astype(np.uint8)
-        img = Image.fromarray(arr)
-        img.save(os.path.join(output_folder, f"mask{current_image_index:03d}.tif"))
-    
+    # Step 5: save per-frame TIFFs.
+    for t in range(T):
+        Image.fromarray(relabeled[t]).save(
+            os.path.join(output_folder, f"mask{t:03d}.tif")
+        )
+
     print(f"Saved track data to '{output_folder}'")
-
-    return combined_mask

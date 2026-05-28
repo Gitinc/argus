@@ -11,10 +11,8 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 from PIL import Image
 from bm3d import bm3d, BM3DProfile
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 IMAGE_CHANNEL = 0
-NO_MATCH = np.array([-1, -1])
 
 def freqgrid2(ysize: int, xsize: int):
     fy = np.fft.fftfreq(ysize)
@@ -81,40 +79,44 @@ def gaussian_psf_2d(size: int, std: float) -> np.ndarray:
     psf /= psf.sum()
     return psf
 
-def monogenic_filter_single_image(image_data,cw =60,sigma_onf = 0.05, sigma_smooth =8):    
-    image_ch = image_data[..., IMAGE_CHANNEL]
-    result = image_data.copy()
+def monogenic_filter_single_image(image_data):
+    i, image = image_data
+    
+    image_ch = image[..., IMAGE_CHANNEL]
+    result = image.copy()
 
     Y, X = image_ch.shape
 
-    filtStruct = create_monogenic_filters_log_gabor(Y, X, wl=cw, sigma_onf=sigma_onf)
+    cw = min(Y, X) / 5.0   # should be optimized
+
+    filtStruct = create_monogenic_filters_log_gabor(Y, X, wl=cw, sigma_onf=0.55)
     m1, m2, m3 = monogenic_signal(image_ch, filtStruct)
     LE = local_energy(m1, m2, m3)
 
-    image_est = scipy.ndimage.gaussian_filter(LE, sigma=sigma_smooth)
+    psf = gaussian_psf_2d(size=int(round(cw)), std=cw / 100.0)
+    image_est = skimage.restoration.richardson_lucy(LE, psf, num_iter=20, clip=False)  # we need to change this
 
-    def rescale_to_uint8(x):
-        x = np.asarray(x, dtype=np.float64)
-        lo, hi = np.percentile(x, (0.5, 99.5))
-        x = (x - lo) / max(hi - lo, 1e-12)
-        x = np.clip(x, 0.0, 1.0)          # <-- critical: clip BEFORE casting
-        return (x * 255.0).astype(np.uint8)
-    
-    result[..., IMAGE_CHANNEL] = rescale_to_uint8(image_est)
+    result[..., IMAGE_CHANNEL] = image_est
+
     return result
 
-def monogenic_filter_images(images, n_workers=None, backend="thread"):
-    n_workers = n_workers or os.cpu_count()
+def monogenic_filter_all_images(images, n_processes=None):
+    # If n_processes is not specified, use all available CPU cores
+    if n_processes is None:
+        n_processes = mp.cpu_count()
+    
+    # Create a pool of workers
+    with mp.Pool(processes=n_processes) as pool:
+        # Create a list of tuples (index, image) to pass to the worker function
+        image_data = [(i, img) for i, img in enumerate(images)]
 
-    if backend == "thread":
-        Executor = ThreadPoolExecutor
-    elif backend == "process":
-        Executor = ProcessPoolExecutor
-    else:
-        raise ValueError(f"Unknown backend: {backend!r}")
-
-    with Executor(max_workers=n_workers) as ex:
-        return list(ex.map(monogenic_filter_single_image, images))
+        # Use partial to create a function with fixed radius parameter
+        process_func = partial(monogenic_filter_single_image)
+        
+        # Process images in parallel and gather results
+        results = pool.map(process_func, image_data)
+    
+    return results
 
 def unsharp_mask(image, sigma=1.0, alpha=1.5):
     """Applies unsharp masking by enhancing edges using a blurred image."""
@@ -385,14 +387,21 @@ def locate_cells(image, min_size=10, expected_mask_size=15, min_distance = 10, m
         
     return np.array(result_coords), thresh_img
 
-def detect_centers(image, cell_size, min_distance, manual_threshold=-1):
+def detect_centers(image, min_size, min_distance, iterations=3, manual_threshold=-1):
     if manual_threshold == -1:
         thresh = skimage.filters.threshold_otsu(image)
     else:
         thresh = manual_threshold
     thresh_img = image > thresh
 
-    thresh_img = skimage.morphology.remove_small_objects(thresh_img, min_size=cell_size)
+    # Remove small objects
+    if iterations > 0:
+        thresh_img = scipy.ndimage.binary_closing(
+            skimage.morphology.remove_small_objects(thresh_img, min_size=min_size),
+            iterations=iterations,
+        )
+    else:
+        thresh_img = skimage.morphology.remove_small_objects(thresh_img, min_size=min_size)
 
     # Label connected components
     labeled_mask = skimage.measure.label(thresh_img)
@@ -507,15 +516,16 @@ def save_images(images, directory, pattern):
     for i in range(len(images)):
         cv2.imwrite(os.path.join(directory , pattern + f"{i:03d}" + ".tif"), np.array(images[i],dtype=np.uint8))
 
-def locate_all_cells_centroids(images, cell_size, min_distance, manual_threshold=-1):
+def locate_all_cells_centroids(images, min_size, min_distance, iterations, manual_threshold=-1):
     edges_list = []
     mask_list = []
     labels_list = []
     for image in images:
         edges, mask, centroid_label_pairs = detect_centers(
             image[:, :, IMAGE_CHANNEL],
-            cell_size=cell_size,
+            min_size=min_size,
             min_distance=min_distance,
+            iterations=iterations,
             manual_threshold=manual_threshold,
         )
 
@@ -615,7 +625,7 @@ def average_direction(points):
     return avg_direction, angle_degrees, avg_vector
 
 #def compute_optical_flow(prev_img, next_img):
-#    return skimage.registration.optical_flow_tvl1(prev_img, next_img, attachment=5
+#    return skimage.registration.optical_flow_tvl1(prev_img, next_img, attachment=5)
 
 def compute_optical_flow(prev_img, next_img):
     # OpenCV requires uint8 or float32
@@ -669,269 +679,116 @@ def subtract_mean_channel(images, axis=0):
 
     return images, mean_img
 
-# ---------------------------------------------------------------------------
-# Geometry / flow helpers
-# ---------------------------------------------------------------------------
+def track_points_optical_flow(images, all_points, all_labels, labeled_masks, max_distance):
+    initial_points = all_points[0]
+    initial_labels = all_labels[0]
+    green_images = [img[:, :, IMAGE_CHANNEL] if img.ndim == 3 else img for img in images]
 
-def _advect_points(points, flow_x, flow_y):
-    """Move each point by the flow vector at its (clipped, integer) pixel."""
-    h, w = flow_x.shape
-    xi = np.clip(points[:, 0].astype(int), 0, w - 1)
-    yi = np.clip(points[:, 1].astype(int), 0, h - 1)
-    return points + np.stack([flow_x[yi, xi], flow_y[yi, xi]], axis=1)
-
-
-def _threshold_small_flow(flow_x, flow_y, eps=0.05):
-    """Zero out flow vectors with magnitude below `eps`."""
-    small = np.hypot(flow_x, flow_y) < eps
-    return np.where(small, 0.0, flow_x), np.where(small, 0.0, flow_y)
-
-
-def _compute_flows_parallel(green_frames):
-    pairs = list(zip(green_frames[:-1], green_frames[1:]))
-    with mp.Pool(mp.cpu_count()) as pool:
-        return pool.starmap(compute_optical_flow, pairs)
-
-
-# ---------------------------------------------------------------------------
-# Track entries
-# ---------------------------------------------------------------------------
-
-def _new_track(track_id, frame_idx, point, label, parent_id=None):
-    """Create a fresh track entry."""
-    return {
-        "ID": track_id,
-        "StartIndex": frame_idx,
-        "Path": [point],
-        "MaskLabels": [label],
-        "AverageDir": np.zeros(2),
-        "Active": True,
-        "Parent": parent_id,
-        "Children": [],
-        "OcclusionCount": 0,
-        "LastSeenIndex": frame_idx,
-        "GhostPos": np.asarray(point, dtype=np.float32),
-    }
-
-
-def _current_position(entry):
-    """Where a track 'is' right now — last detection, or ghost if occluded."""
-    return entry["GhostPos"] if entry["OcclusionCount"] > 0 else entry["Path"][-1]
-
-
-def _paint(tracked_mask, frame_idx, labeled_mask, label, track_id):
-    """Paint pixels of `label` in `frame_idx` with `track_id + 1` (IDs stay nonzero)."""
-    if label is None or labeled_mask is None:
-        return
-    tracked_mask[frame_idx][labeled_mask == label] = track_id + 1
-
-
-def _spawn_track(dict_list, tracked_mask, labeled_mask, frame_idx,
-                 point, label, parent_id=None):
-    """Append a new track and paint its mask. Returns the new track ID."""
-    new_id = len(dict_list)
-    dict_list.append(_new_track(new_id, frame_idx, point, label, parent_id))
-    _paint(tracked_mask, frame_idx, labeled_mask, label, new_id)
-    return new_id
-
-
-def _extend_track(entry, point, label, frame_idx, tracked_mask, labeled_mask):
-    """Append a real detection to a track."""
-    entry["Path"].append(point)
-    entry["MaskLabels"].append(label)
-    entry["OcclusionCount"] = 0
-    entry["LastSeenIndex"] = frame_idx
-    entry["GhostPos"] = np.asarray(point, dtype=np.float32)
-    _paint(tracked_mask, frame_idx, labeled_mask, label, entry["ID"])
-    if len(entry["Path"]) > 1:
-        _, _, entry["AverageDir"] = average_direction(np.array(entry["Path"]))
-
-
-def _mark_occluded(entry, flow_x, flow_y, max_occlusion_frames):
-    """No detection this frame: advect ghost, retire if past occlusion budget."""
-    entry["GhostPos"] = _advect_points(entry["GhostPos"].reshape(1, 2),
-                                       flow_x, flow_y)[0]
-    entry["OcclusionCount"] += 1
-    if entry["OcclusionCount"] > max_occlusion_frames:
-        entry["Active"] = False
-
-
-# ---------------------------------------------------------------------------
-# Matching helpers
-# ---------------------------------------------------------------------------
-
-def _is_no_match(match):
-    return np.array_equal(match, NO_MATCH)
-
-
-def _round_key(point):
-    """Hashable key for a 2D point, robust to float jitter."""
-    return (round(float(point[0]), 6), round(float(point[1]), 6))
-
-
-def _build_label_lookup(points, labels):
-    """Map each detected point to its mask label."""
-    return {_round_key(p): int(l) for p, l in zip(points, labels)}
-
-
-def _find_collisions(matches, active_indices, label_of):
-    """
-    Return entry indices whose matched detections collided in the same mask
-    label (multiple tracks predicted into one cell).
-    """
-    label_to_tracks = {}
-    for k, entry_idx in enumerate(active_indices):
-        if _is_no_match(matches[k]):
-            continue
-        label = label_of(matches[k])
-        if label is None:
-            continue
-        label_to_tracks.setdefault(label, []).append(entry_idx)
-
-    return {idx for tracks in label_to_tracks.values()
-                if len(tracks) > 1
-                for idx in tracks}
-
-
-def _find_split_partner(prediction, matched_label, unmatched_points,
-                        consumed, label_of, max_distance):
-    """
-    Find the nearest unmatched detection that is within `max_distance` of
-    `prediction` and lies in a *different* mask than `matched_label`.
-    Returns (unmatched_index, point) or None.
-    """
-    best = None  # (distance, ui, point)
-    for ui, point in enumerate(unmatched_points):
-        if ui in consumed or label_of(point) == matched_label:
-            continue
-        dist = float(np.hypot(point[0] - prediction[0], point[1] - prediction[1]))
-        if dist > max_distance:
-            continue
-        if best is None or dist < best[0]:
-            best = (dist, ui, point)
-
-    if best is None:
-        return None
-    _, ui, point = best
-    return ui, point
-
-
-def _split_parent_into_daughters(parent, daughter_a, daughter_b, frame_idx,
-                                 dict_list, tracked_mask, labeled_mask):
-    """
-    Roll back the parent's tentative extension into `frame_idx` and replace
-    it with two new daughter tracks (mitosis-like event).
-    """
-    parent["Path"].pop()
-    parent["MaskLabels"].pop()
-    parent["Active"] = False
-    tracked_mask[frame_idx][tracked_mask[frame_idx] == parent["ID"] + 1] = 0
-
-    a_point, a_label = daughter_a
-    b_point, b_label = daughter_b
-    a_id = _spawn_track(dict_list, tracked_mask, labeled_mask, frame_idx,
-                        a_point, a_label, parent_id=parent["ID"])
-    b_id = _spawn_track(dict_list, tracked_mask, labeled_mask, frame_idx,
-                        b_point, b_label, parent_id=parent["ID"])
-    parent["Children"] = [a_id, b_id]
-
-
-# ---------------------------------------------------------------------------
-# Main tracker
-# ---------------------------------------------------------------------------
-
-def track_points_optical_flow(images, all_points, all_labels, labeled_masks,
-                              max_distance, max_occlusion_frames=5):
-    # --- Setup ---
-    green = [img[:, :, IMAGE_CHANNEL] if img.ndim == 3 else img for img in images]
-    T, H, W = len(labeled_masks), *labeled_masks[0].shape
+    T = len(labeled_masks)
+    H, W = labeled_masks[0].shape
+    # Single 3D mask: tracked_mask[t] has each tracked object's ID where its
+    # mask is, 0 elsewhere. Filled in as we go.
     tracked_mask = np.zeros((T, H, W), dtype=np.int32)
-    average_flow = np.zeros((H, W), dtype=np.float32)
+
     dict_list = []
+    for i in range(initial_points.shape[0]):
+        item = {
+            "Path": [initial_points[i]],
+            "AverageDir": [0, 0],
+            "StartIndex": 0,
+            "Active": True,
+            "ID": i,
+            "MaskLabels": [int(initial_labels[i])],  # per-frame label in labeled_masks[StartIndex + k]
+        }
+        dict_list.append(item)
+        # Paint this object's pixels in frame 0 with its tracking ID
+        tracked_mask[0][labeled_masks[0] == initial_labels[i]] = item["ID"] + 1  # +1 so IDs stay nonzero
 
-    # Seed tracks from frame 0.
-    for point, label in zip(all_points[0], all_labels[0]):
-        _spawn_track(dict_list, tracked_mask, labeled_masks[0],
-                     frame_idx=0, point=point, label=int(label))
+    current_points = initial_points
 
-    flows = _compute_flows_parallel(green)
+    average_flow = np.zeros_like(green_images[0], dtype=np.float32)
 
-    # --- Main loop: propagate tracks frame by frame ---
-    for t, (flow_y, flow_x) in enumerate(flows):
-        t_next = t + 1
-        print(f"Working on image: {t}")
-
-        flow_x, flow_y = _threshold_small_flow(flow_x, flow_y)
-        average_flow += np.hypot(flow_x, flow_y)
-
-        active_indices = [i for i, e in enumerate(dict_list) if e["Active"]]
-        if not active_indices:
-            continue
-
-        # 1. Predict where each active track lands in t_next.
-        current_points = np.array([_current_position(dict_list[i])
-                                   for i in active_indices])
-        predicted = _advect_points(current_points, flow_x, flow_y)
-
-        # 2. Match predictions to detections.
-        detected = all_points[t_next]
-        matches, unmatched_points = hungarian_assignment(
-            predicted, detected, max_distance=max_distance,
+    with mp.Pool(mp.cpu_count()) as pool:
+        flows = pool.starmap(
+            compute_optical_flow,
+            [(green_images[i], green_images[i + 1]) for i in range(len(images) - 1)],
         )
-        label_lookup = _build_label_lookup(detected, all_labels[t_next])
-        label_of = lambda point: label_lookup.get(_round_key(point))
 
-        # 3. Find tracks that landed in the same mask (merge / ambiguity).
-        collided = _find_collisions(matches, active_indices, label_of)
+    for i_images, flow in enumerate(flows):
+        print("Working on image: ", i_images)
+        t_next = i_images + 1
+        flow_y, flow_x = flow
+        flow_x[flow_x < 0.05] = 0
+        flow_y[flow_y < 0.05] = 0
+        average_flow += np.sqrt(flow_x**2 + flow_y**2)
 
-        # 4. Extend matched tracks; occlude unmatched / collided ones.
-        for k, entry_idx in enumerate(active_indices):
-            entry = dict_list[entry_idx]
-            match = matches[k]
-            if _is_no_match(match) or entry_idx in collided:
-                _mark_occluded(entry, flow_x, flow_y, max_occlusion_frames)
+        h, w = flow_x.shape
+        flow_points = np.array([
+            [
+                x + flow_x[min(max(int(y), 0), h - 1), min(max(int(x), 0), w - 1)],
+                y + flow_y[min(max(int(y), 0), h - 1), min(max(int(x), 0), w - 1)],
+            ]
+            for x, y in current_points
+        ])
+
+        calculated_edges = all_points[t_next]
+        calculated_labels = all_labels[t_next]
+
+        matches, unmatched_points = hungarian_assignment(
+            flow_points, calculated_edges, max_distance=max_distance
+        )
+
+        # We also need to know, for each matched detection in frame t_next,
+        # which label in labeled_masks[t_next] it corresponds to. Build an
+        # index from point -> label in frame t_next.
+        # hungarian_assignment returns matched coordinates; map them back to labels.
+        # Easiest: build a small lookup keyed by exact coordinate tuple.
+        coord_to_label_next = {
+            (float(p[0]), float(p[1])): int(l)
+            for p, l in zip(calculated_edges, calculated_labels)
+        }
+
+        matched_label_per_entry = []
+        for i_dict_list, entry in enumerate(dict_list):
+            if not entry["Active"]:
+                matched_label_per_entry.append(None)
+                continue
+
+            if not np.array_equal(matches[i_dict_list], [-1, -1]):
+                matched_point = matches[i_dict_list]
+                entry["Path"].append(matched_point)
+
+                lbl_next = coord_to_label_next.get(
+                    (float(matched_point[0]), float(matched_point[1]))
+                )
+                entry["MaskLabels"].append(lbl_next)
+                matched_label_per_entry.append(lbl_next)
+
+                # Paint object pixels in frame t_next with this object's tracking ID
+                if lbl_next is not None:
+                    tracked_mask[t_next][labeled_masks[t_next] == lbl_next] = entry["ID"] + 1
+
+                if len(entry["Path"]) > 1:
+                    _, _, avg_dir = average_direction(np.array(entry["Path"]))
+                    entry["AverageDir"] = avg_dir
             else:
-                _extend_track(entry, match, label_of(match), t_next,
-                              tracked_mask, labeled_masks[t_next])
+                matched_label_per_entry.append(None)
 
-        # 5. Detect splits: parent has a match, but another unmatched detection
-        #    lies nearby in a *different* mask -> mitosis-like event.
-        consumed_unmatched = set()
-        for k, entry_idx in enumerate(active_indices):
-            if entry_idx in collided or _is_no_match(matches[k]):
-                continue
+        for idx, point in enumerate(unmatched_points):
+            lbl_next = coord_to_label_next.get((float(point[0]), float(point[1])))
+            new_id = len(dict_list)  # zero-based; painted as +1 below
+            dict_list.append({
+                "Path": [point],
+                "AverageDir": [0, 0],
+                "StartIndex": t_next,
+                "Active": True,
+                "ID": new_id,
+                "MaskLabels": [lbl_next],
+            })
+            if lbl_next is not None:
+                tracked_mask[t_next][labeled_masks[t_next] == lbl_next] = new_id + 1
 
-            parent = dict_list[entry_idx]
-            matched_label = label_of(matches[k])
-            partner = _find_split_partner(
-                prediction=predicted[k],
-                matched_label=matched_label,
-                unmatched_points=unmatched_points,
-                consumed=consumed_unmatched,
-                label_of=label_of,
-                max_distance=max_distance,
-            )
-            if partner is None:
-                continue
-
-            ui, partner_point = partner
-            consumed_unmatched.add(ui)
-            _split_parent_into_daughters(
-                parent=parent,
-                daughter_a=(matches[k], matched_label),
-                daughter_b=(partner_point, label_of(partner_point)),
-                frame_idx=t_next,
-                dict_list=dict_list,
-                tracked_mask=tracked_mask,
-                labeled_mask=labeled_masks[t_next],
-            )
-
-        # 6. Spawn new tracks from any leftover unmatched detections.
-        for ui, point in enumerate(unmatched_points):
-            if ui in consumed_unmatched:
-                continue
-            _spawn_track(dict_list, tracked_mask, labeled_masks[t_next],
-                         frame_idx=t_next, point=point, label=label_of(point))
+        current_points = np.array([entry["Path"][-1] for entry in dict_list])
 
     return dict_list, average_flow, tracked_mask
 
@@ -1285,6 +1142,7 @@ def median_denoise_single_image(image_data, size):
 def log_transform_single_image(image_data):
     i, image = image_data
     
+    # Compute the unsharp mask on the green channel
     c = 255 / np.log(1 + np.max(image[..., IMAGE_CHANNEL]))
     log_image = c * (np.log(image[..., IMAGE_CHANNEL] + 1))
     
@@ -1305,11 +1163,13 @@ def bm3d_denoise_single_image(image_data):
     return result
 
 def wavelet_denoise_single_image(image_data):
+    i, image = image_data
+
     # Compute the unsharp mask on the green channel
-    image_est = skimage.restoration.denoise_wavelet(image_data[..., IMAGE_CHANNEL]);
+    image_est = skimage.restoration.denoise_wavelet(image[..., IMAGE_CHANNEL]);
     
-    result = image_data.copy()
-    result[..., IMAGE_CHANNEL] = np.array(image_est*255,dtype = np.uint8)
+    result = image.copy()
+    result[..., IMAGE_CHANNEL] = np.array(rescale_rgb_to_255(image_est, channel = None),dtype = np.uint8)
 
     return result
 
@@ -1373,7 +1233,20 @@ def bm3d_denoise_all(images, max_workers=None):
     
     return denoised_images
 
-def wavelet_denoise_images_all(images):
-    """Apply wavelet denoising to a list of images."""
-    return [wavelet_denoise_single_image(img) for img in images]
+def wavelet_denoise_all(images, n_processes=None):
+    # If n_processes is not specified, use all available CPU cores
+    if n_processes is None:
+        n_processes = mp.cpu_count()
+    
+    # Create a pool of workers
+    with mp.Pool(processes=n_processes) as pool:
+        # Create a list of tuples (index, image) to pass to the worker function
+        image_data = [(i, img) for i, img in enumerate(images)]
 
+        # Use partial to create a function with fixed radius parameter
+        process_func = partial(wavelet_denoise_single_image)
+        
+        # Process images in parallel and gather results
+        results = pool.map(process_func, image_data)
+    
+    return results

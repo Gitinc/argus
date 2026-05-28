@@ -11,10 +11,8 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 from PIL import Image
 from bm3d import bm3d, BM3DProfile
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 IMAGE_CHANNEL = 0
-NO_MATCH = np.array([-1, -1])
 
 def freqgrid2(ysize: int, xsize: int):
     fy = np.fft.fftfreq(ysize)
@@ -81,40 +79,44 @@ def gaussian_psf_2d(size: int, std: float) -> np.ndarray:
     psf /= psf.sum()
     return psf
 
-def monogenic_filter_single_image(image_data,cw =60,sigma_onf = 0.05, sigma_smooth =8):    
-    image_ch = image_data[..., IMAGE_CHANNEL]
-    result = image_data.copy()
+def monogenic_filter_single_image(image_data):
+    i, image = image_data
+    
+    image_ch = image[..., IMAGE_CHANNEL]
+    result = image.copy()
 
     Y, X = image_ch.shape
 
-    filtStruct = create_monogenic_filters_log_gabor(Y, X, wl=cw, sigma_onf=sigma_onf)
+    cw = min(Y, X) / 5.0   # should be optimized
+
+    filtStruct = create_monogenic_filters_log_gabor(Y, X, wl=cw, sigma_onf=0.55)
     m1, m2, m3 = monogenic_signal(image_ch, filtStruct)
     LE = local_energy(m1, m2, m3)
 
-    image_est = scipy.ndimage.gaussian_filter(LE, sigma=sigma_smooth)
+    psf = gaussian_psf_2d(size=int(round(cw)), std=cw / 100.0)
+    image_est = skimage.restoration.richardson_lucy(LE, psf, num_iter=20, clip=False)  # we need to change this
 
-    def rescale_to_uint8(x):
-        x = np.asarray(x, dtype=np.float64)
-        lo, hi = np.percentile(x, (0.5, 99.5))
-        x = (x - lo) / max(hi - lo, 1e-12)
-        x = np.clip(x, 0.0, 1.0)          # <-- critical: clip BEFORE casting
-        return (x * 255.0).astype(np.uint8)
-    
-    result[..., IMAGE_CHANNEL] = rescale_to_uint8(image_est)
+    result[..., IMAGE_CHANNEL] = image_est
+
     return result
 
-def monogenic_filter_images(images, n_workers=None, backend="thread"):
-    n_workers = n_workers or os.cpu_count()
+def monogenic_filter_all_images(images, n_processes=None):
+    # If n_processes is not specified, use all available CPU cores
+    if n_processes is None:
+        n_processes = mp.cpu_count()
+    
+    # Create a pool of workers
+    with mp.Pool(processes=n_processes) as pool:
+        # Create a list of tuples (index, image) to pass to the worker function
+        image_data = [(i, img) for i, img in enumerate(images)]
 
-    if backend == "thread":
-        Executor = ThreadPoolExecutor
-    elif backend == "process":
-        Executor = ProcessPoolExecutor
-    else:
-        raise ValueError(f"Unknown backend: {backend!r}")
-
-    with Executor(max_workers=n_workers) as ex:
-        return list(ex.map(monogenic_filter_single_image, images))
+        # Use partial to create a function with fixed radius parameter
+        process_func = partial(monogenic_filter_single_image)
+        
+        # Process images in parallel and gather results
+        results = pool.map(process_func, image_data)
+    
+    return results
 
 def unsharp_mask(image, sigma=1.0, alpha=1.5):
     """Applies unsharp masking by enhancing edges using a blurred image."""
@@ -385,51 +387,45 @@ def locate_cells(image, min_size=10, expected_mask_size=15, min_distance = 10, m
         
     return np.array(result_coords), thresh_img
 
-def detect_centers(image, cell_size, min_distance, manual_threshold=-1):
+def detect_centers_old(image, min_size, min_distance, iterations = 3, manual_threshold = -1):
     if manual_threshold == -1:
         thresh = skimage.filters.threshold_otsu(image)
     else:
         thresh = manual_threshold
+    
     thresh_img = image > thresh
-
-    thresh_img = skimage.morphology.remove_small_objects(thresh_img, min_size=cell_size)
-
+    
+    # Remove small objects
+    if iterations>0:
+        thresh_img = scipy.ndimage.binary_closing(skimage.morphology.remove_small_objects(thresh_img, min_size=min_size), iterations = iterations)
+    else:
+        thresh_img = skimage.morphology.remove_small_objects(thresh_img, min_size=min_size)
+    
     # Label connected components
     labeled_mask = skimage.measure.label(thresh_img)
-    centers = []  # list of ((y, x), area, original_label)
+
+    centers = []
     for region in skimage.measure.regionprops(labeled_mask):
-        y, x = region.centroid
-        centers.append(((int(round(y)), int(round(x))), region.area, region.label))
-
-    # Decide which centers to keep
+        y, x = region.centroid  # (row, col)
+        centers.append(((int(round(y)), int(round(x))), region.area))
+        
     if min_distance is None or min_distance <= 0:
-        kept = [(c, lbl) for (c, _a, lbl) in centers]
-    else:
-        # Prefer larger regions: sort by area (desc)
-        centers.sort(key=lambda t: t[1], reverse=True)
-        # Greedy non-maximum suppression by distance
-        kept = []
-        kept_coords = []
-        for (cy, cx), _area, lbl in centers:
-            if not kept_coords:
-                kept.append(((cy, cx), lbl))
-                kept_coords.append((cy, cx))
-                continue
-            d = np.linalg.norm(np.array(kept_coords) - np.array([cy, cx]), axis=1)
-            if np.all(d >= min_distance):
-                kept.append(((cy, cx), lbl))
-                kept_coords.append((cy, cx))
+        return np.array([c for (c, _) in centers], dtype=int), thresh_img
 
-    # Build output mask: each kept component gets a new integer label (1, 2, ...)
-    out_mask = np.zeros_like(labeled_mask, dtype=np.int32)
-    kept_points = []
-    centroid_label_pairs = []  # list of ((y, x), new_label)
-    for new_label, ((cy, cx), orig_label) in enumerate(kept, start=1):
-        out_mask[labeled_mask == orig_label] = new_label
-        kept_points.append((cy, cx))
-        centroid_label_pairs.append(((cy, cx), new_label))
+    # Prefer larger regions: sort by area (desc)
+    centers.sort(key=lambda t: t[1], reverse=True)
 
-    return np.array(kept_points, dtype=int), out_mask, centroid_label_pairs
+    # Greedy non-maximum suppression by distance
+    kept = []
+    for (cy, cx), _area in centers:
+        if not kept:
+            kept.append((cy, cx))
+            continue
+        d = np.linalg.norm(np.array(kept) - np.array([cy, cx]), axis=1)
+        if np.all(d >= min_distance):
+            kept.append((cy, cx))
+
+    return np.array(kept, dtype=int), thresh_img
 
 def image_registration(fixed_img, moving_img, registration_channel=-1, n_processes = None):
     if n_processes is None:
@@ -507,30 +503,16 @@ def save_images(images, directory, pattern):
     for i in range(len(images)):
         cv2.imwrite(os.path.join(directory , pattern + f"{i:03d}" + ".tif"), np.array(images[i],dtype=np.uint8))
 
-def locate_all_cells_centroids(images, cell_size, min_distance, manual_threshold=-1):
+def locate_all_cells_centroids(images, min_size, min_distance, iterations, manual_threshold = -1):
     edges_list = []
     mask_list = []
-    labels_list = []
     for image in images:
-        edges, mask, centroid_label_pairs = detect_centers(
-            image[:, :, IMAGE_CHANNEL],
-            cell_size=cell_size,
-            min_distance=min_distance,
-            manual_threshold=manual_threshold,
-        )
-
-        # Swap (y, x) -> (x, y); centroid_label_pairs is in the SAME order as edges,
-        # so the labels stay aligned after the swap.
-        edges_copy = edges.copy()
+        edges, mask = detect_centers(image[:,:,IMAGE_CHANNEL], min_size=min_size, min_distance = min_distance, iterations = iterations, manual_threshold = manual_threshold)
+        edges_copy = edges.copy()  # Optional: create a copy to avoid modifying in-place
         edges[:, 0], edges[:, 1] = edges_copy[:, 1], edges_copy[:, 0]
-
-        labels = np.array([lbl for (_pt, lbl) in centroid_label_pairs], dtype=np.int32)
-
         edges_list.append(edges)
         mask_list.append(mask)
-        labels_list.append(labels)
-
-    return edges_list, mask_list, labels_list
+    return edges_list, mask_list
 
 def locate_all_cells_local_maxima(images, min_size=10, expected_mask_size=15, min_distance = 10, manual_threshold = -1):
     edges_list = []
@@ -614,29 +596,8 @@ def average_direction(points):
     
     return avg_direction, angle_degrees, avg_vector
 
-#def compute_optical_flow(prev_img, next_img):
-#    return skimage.registration.optical_flow_tvl1(prev_img, next_img, attachment=5
-
 def compute_optical_flow(prev_img, next_img):
-    # OpenCV requires uint8 or float32
-    if prev_img.dtype not in (np.uint8, np.float32):
-        # Normalize to float32 in [0, 1] to preserve dynamic range
-        prev_img = prev_img.astype(np.float32)
-        next_img = next_img.astype(np.float32)
-        # Joint min/max so both frames share the same scale
-        lo = min(prev_img.min(), next_img.min())
-        hi = max(prev_img.max(), next_img.max())
-        if hi > lo:
-            prev_img = (prev_img - lo) / (hi - lo)
-            next_img = (next_img - lo) / (hi - lo)
-
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_img, next_img, None,
-        pyr_scale=0.5, levels=3, winsize=15,
-        iterations=3, poly_n=5, poly_sigma=1.2, flags=0
-    )
-    # (H, W, 2) with (dx, dy) → (2, H, W) with (dy, dx) to match skimage
-    return flow.transpose(2, 0, 1)[::-1]
+    return skimage.registration.optical_flow_tvl1(prev_img, next_img, attachment=5)
 
 def find_current_mask(point, mask):
     x, y = map(int, point[::-1])
@@ -669,524 +630,82 @@ def subtract_mean_channel(images, axis=0):
 
     return images, mean_img
 
-# ---------------------------------------------------------------------------
-# Geometry / flow helpers
-# ---------------------------------------------------------------------------
-
-def _advect_points(points, flow_x, flow_y):
-    """Move each point by the flow vector at its (clipped, integer) pixel."""
-    h, w = flow_x.shape
-    xi = np.clip(points[:, 0].astype(int), 0, w - 1)
-    yi = np.clip(points[:, 1].astype(int), 0, h - 1)
-    return points + np.stack([flow_x[yi, xi], flow_y[yi, xi]], axis=1)
-
-
-def _threshold_small_flow(flow_x, flow_y, eps=0.05):
-    """Zero out flow vectors with magnitude below `eps`."""
-    small = np.hypot(flow_x, flow_y) < eps
-    return np.where(small, 0.0, flow_x), np.where(small, 0.0, flow_y)
-
-
-def _compute_flows_parallel(green_frames):
-    pairs = list(zip(green_frames[:-1], green_frames[1:]))
-    with mp.Pool(mp.cpu_count()) as pool:
-        return pool.starmap(compute_optical_flow, pairs)
-
-
-# ---------------------------------------------------------------------------
-# Track entries
-# ---------------------------------------------------------------------------
-
-def _new_track(track_id, frame_idx, point, label, parent_id=None):
-    """Create a fresh track entry."""
-    return {
-        "ID": track_id,
-        "StartIndex": frame_idx,
-        "Path": [point],
-        "MaskLabels": [label],
-        "AverageDir": np.zeros(2),
-        "Active": True,
-        "Parent": parent_id,
-        "Children": [],
-        "OcclusionCount": 0,
-        "LastSeenIndex": frame_idx,
-        "GhostPos": np.asarray(point, dtype=np.float32),
-    }
-
-
-def _current_position(entry):
-    """Where a track 'is' right now — last detection, or ghost if occluded."""
-    return entry["GhostPos"] if entry["OcclusionCount"] > 0 else entry["Path"][-1]
-
-
-def _paint(tracked_mask, frame_idx, labeled_mask, label, track_id):
-    """Paint pixels of `label` in `frame_idx` with `track_id + 1` (IDs stay nonzero)."""
-    if label is None or labeled_mask is None:
-        return
-    tracked_mask[frame_idx][labeled_mask == label] = track_id + 1
-
-
-def _spawn_track(dict_list, tracked_mask, labeled_mask, frame_idx,
-                 point, label, parent_id=None):
-    """Append a new track and paint its mask. Returns the new track ID."""
-    new_id = len(dict_list)
-    dict_list.append(_new_track(new_id, frame_idx, point, label, parent_id))
-    _paint(tracked_mask, frame_idx, labeled_mask, label, new_id)
-    return new_id
-
-
-def _extend_track(entry, point, label, frame_idx, tracked_mask, labeled_mask):
-    """Append a real detection to a track."""
-    entry["Path"].append(point)
-    entry["MaskLabels"].append(label)
-    entry["OcclusionCount"] = 0
-    entry["LastSeenIndex"] = frame_idx
-    entry["GhostPos"] = np.asarray(point, dtype=np.float32)
-    _paint(tracked_mask, frame_idx, labeled_mask, label, entry["ID"])
-    if len(entry["Path"]) > 1:
-        _, _, entry["AverageDir"] = average_direction(np.array(entry["Path"]))
-
-
-def _mark_occluded(entry, flow_x, flow_y, max_occlusion_frames):
-    """No detection this frame: advect ghost, retire if past occlusion budget."""
-    entry["GhostPos"] = _advect_points(entry["GhostPos"].reshape(1, 2),
-                                       flow_x, flow_y)[0]
-    entry["OcclusionCount"] += 1
-    if entry["OcclusionCount"] > max_occlusion_frames:
-        entry["Active"] = False
-
-
-# ---------------------------------------------------------------------------
-# Matching helpers
-# ---------------------------------------------------------------------------
-
-def _is_no_match(match):
-    return np.array_equal(match, NO_MATCH)
-
-
-def _round_key(point):
-    """Hashable key for a 2D point, robust to float jitter."""
-    return (round(float(point[0]), 6), round(float(point[1]), 6))
-
-
-def _build_label_lookup(points, labels):
-    """Map each detected point to its mask label."""
-    return {_round_key(p): int(l) for p, l in zip(points, labels)}
-
-
-def _find_collisions(matches, active_indices, label_of):
-    """
-    Return entry indices whose matched detections collided in the same mask
-    label (multiple tracks predicted into one cell).
-    """
-    label_to_tracks = {}
-    for k, entry_idx in enumerate(active_indices):
-        if _is_no_match(matches[k]):
-            continue
-        label = label_of(matches[k])
-        if label is None:
-            continue
-        label_to_tracks.setdefault(label, []).append(entry_idx)
-
-    return {idx for tracks in label_to_tracks.values()
-                if len(tracks) > 1
-                for idx in tracks}
-
-
-def _find_split_partner(prediction, matched_label, unmatched_points,
-                        consumed, label_of, max_distance):
-    """
-    Find the nearest unmatched detection that is within `max_distance` of
-    `prediction` and lies in a *different* mask than `matched_label`.
-    Returns (unmatched_index, point) or None.
-    """
-    best = None  # (distance, ui, point)
-    for ui, point in enumerate(unmatched_points):
-        if ui in consumed or label_of(point) == matched_label:
-            continue
-        dist = float(np.hypot(point[0] - prediction[0], point[1] - prediction[1]))
-        if dist > max_distance:
-            continue
-        if best is None or dist < best[0]:
-            best = (dist, ui, point)
-
-    if best is None:
-        return None
-    _, ui, point = best
-    return ui, point
-
-
-def _split_parent_into_daughters(parent, daughter_a, daughter_b, frame_idx,
-                                 dict_list, tracked_mask, labeled_mask):
-    """
-    Roll back the parent's tentative extension into `frame_idx` and replace
-    it with two new daughter tracks (mitosis-like event).
-    """
-    parent["Path"].pop()
-    parent["MaskLabels"].pop()
-    parent["Active"] = False
-    tracked_mask[frame_idx][tracked_mask[frame_idx] == parent["ID"] + 1] = 0
-
-    a_point, a_label = daughter_a
-    b_point, b_label = daughter_b
-    a_id = _spawn_track(dict_list, tracked_mask, labeled_mask, frame_idx,
-                        a_point, a_label, parent_id=parent["ID"])
-    b_id = _spawn_track(dict_list, tracked_mask, labeled_mask, frame_idx,
-                        b_point, b_label, parent_id=parent["ID"])
-    parent["Children"] = [a_id, b_id]
-
-
-# ---------------------------------------------------------------------------
-# Main tracker
-# ---------------------------------------------------------------------------
-
-def track_points_optical_flow(images, all_points, all_labels, labeled_masks,
-                              max_distance, max_occlusion_frames=5):
-    # --- Setup ---
-    green = [img[:, :, IMAGE_CHANNEL] if img.ndim == 3 else img for img in images]
-    T, H, W = len(labeled_masks), *labeled_masks[0].shape
-    tracked_mask = np.zeros((T, H, W), dtype=np.int32)
-    average_flow = np.zeros((H, W), dtype=np.float32)
-    dict_list = []
-
-    # Seed tracks from frame 0.
-    for point, label in zip(all_points[0], all_labels[0]):
-        _spawn_track(dict_list, tracked_mask, labeled_masks[0],
-                     frame_idx=0, point=point, label=int(label))
-
-    flows = _compute_flows_parallel(green)
-
-    # --- Main loop: propagate tracks frame by frame ---
-    for t, (flow_y, flow_x) in enumerate(flows):
-        t_next = t + 1
-        print(f"Working on image: {t}")
-
-        flow_x, flow_y = _threshold_small_flow(flow_x, flow_y)
-        average_flow += np.hypot(flow_x, flow_y)
-
-        active_indices = [i for i, e in enumerate(dict_list) if e["Active"]]
-        if not active_indices:
-            continue
-
-        # 1. Predict where each active track lands in t_next.
-        current_points = np.array([_current_position(dict_list[i])
-                                   for i in active_indices])
-        predicted = _advect_points(current_points, flow_x, flow_y)
-
-        # 2. Match predictions to detections.
-        detected = all_points[t_next]
-        matches, unmatched_points = hungarian_assignment(
-            predicted, detected, max_distance=max_distance,
-        )
-        label_lookup = _build_label_lookup(detected, all_labels[t_next])
-        label_of = lambda point: label_lookup.get(_round_key(point))
-
-        # 3. Find tracks that landed in the same mask (merge / ambiguity).
-        collided = _find_collisions(matches, active_indices, label_of)
-
-        # 4. Extend matched tracks; occlude unmatched / collided ones.
-        for k, entry_idx in enumerate(active_indices):
-            entry = dict_list[entry_idx]
-            match = matches[k]
-            if _is_no_match(match) or entry_idx in collided:
-                _mark_occluded(entry, flow_x, flow_y, max_occlusion_frames)
-            else:
-                _extend_track(entry, match, label_of(match), t_next,
-                              tracked_mask, labeled_masks[t_next])
-
-        # 5. Detect splits: parent has a match, but another unmatched detection
-        #    lies nearby in a *different* mask -> mitosis-like event.
-        consumed_unmatched = set()
-        for k, entry_idx in enumerate(active_indices):
-            if entry_idx in collided or _is_no_match(matches[k]):
-                continue
-
-            parent = dict_list[entry_idx]
-            matched_label = label_of(matches[k])
-            partner = _find_split_partner(
-                prediction=predicted[k],
-                matched_label=matched_label,
-                unmatched_points=unmatched_points,
-                consumed=consumed_unmatched,
-                label_of=label_of,
-                max_distance=max_distance,
-            )
-            if partner is None:
-                continue
-
-            ui, partner_point = partner
-            consumed_unmatched.add(ui)
-            _split_parent_into_daughters(
-                parent=parent,
-                daughter_a=(matches[k], matched_label),
-                daughter_b=(partner_point, label_of(partner_point)),
-                frame_idx=t_next,
-                dict_list=dict_list,
-                tracked_mask=tracked_mask,
-                labeled_mask=labeled_masks[t_next],
-            )
-
-        # 6. Spawn new tracks from any leftover unmatched detections.
-        for ui, point in enumerate(unmatched_points):
-            if ui in consumed_unmatched:
-                continue
-            _spawn_track(dict_list, tracked_mask, labeled_masks[t_next],
-                         frame_idx=t_next, point=point, label=label_of(point))
-
-    return dict_list, average_flow, tracked_mask
-
-def track_points_nearest_neighbor(
-    images, all_points, all_labels, labeled_masks, max_distance,
-    mitosis_distance=None,        # max distance between two daughter candidates (defaults to max_distance)
-    mitosis_area_ratio=0.6,       # each daughter should be >= this * parent area (tunable)
-    mitosis_pair_area_ratio=1.5,  # combined daughter area <= this * parent area (tunable)
-):
-    """
-    Nearest-neighbor tracker with a mitosis/split heuristic.
-
-    Mitosis is declared at frame t_next for a parent track when:
-      1. The parent matched some detection A in t_next (Hungarian result), AND
-      2. There exists an unmatched detection B in t_next within `mitosis_distance`
-         of the parent's last position, AND
-      3. A and B are themselves within `mitosis_distance` of each other, AND
-      4. The combined mask area of A and B is consistent with the parent's
-         previous area (controlled by mitosis_area_ratio / mitosis_pair_area_ratio).
-
-    On a confirmed split, the parent is deactivated and two fresh daughter tracks
-    are spawned at t_next. The parent's ID is recorded on each daughter for
-    lineage bookkeeping.
-    """
-    if mitosis_distance is None:
-        mitosis_distance = max_distance
-
+def track_points_optical_flow(images, all_points, mask_list, max_distance):
     initial_points = all_points[0]
-    initial_labels = all_labels[0]
+    green_images = [img[:, :, IMAGE_CHANNEL] if img.ndim == 3 else img for img in images]
 
-    T = len(labeled_masks)
-    H, W = labeled_masks[0].shape
-
-    tracked_mask = np.zeros((T, H, W), dtype=np.int32)
-
+    labeled_mask_list = [scipy.ndimage.label(mask)[0] for mask in mask_list]
+    
     dict_list = []
     for i in range(initial_points.shape[0]):
+        # (x,y) needs to be swaped to (y,x)
+        curr_mask = find_current_mask(point= initial_points[i], mask = labeled_mask_list[0])
+        
         item = {
             "Path": [initial_points[i]],
             "AverageDir": [0, 0],
             "StartIndex": 0,
             "Active": True,
             "ID": i,
-            "MaskLabels": [int(initial_labels[i])],
-            "ParentID": None,          # set on daughters
-            "EndReason": None,         # "mitosis", "lost", or None while active
-            "DaughterIDs": [],         # set on the parent at division time
+            "Mask": [curr_mask]
         }
         dict_list.append(item)
-        tracked_mask[0][labeled_masks[0] == initial_labels[i]] = item["ID"] + 1
-
+        
     current_points = initial_points
-
-    for t_prev in range(len(images) - 1):
-        t_next = t_prev + 1
-        print("Working on image: ", t_prev)
-
-        calculated_edges = all_points[t_next]
-        calculated_labels = all_labels[t_next]
-
-        matches, unmatched_points = hungarian_assignment(
-            current_points, calculated_edges, max_distance=max_distance
-        )
-
-        coord_to_label_next = {
-            (float(p[0]), float(p[1])): int(l)
-            for p, l in zip(calculated_edges, calculated_labels)
-        }
-
-        # Track which unmatched detections actually get consumed by mitosis
-        # so we don't also spawn a brand-new singleton track from them below.
-        unmatched_list = [tuple(map(float, p)) for p in unmatched_points]
-        consumed_unmatched = set()
-
-        # --- Pass 1: handle Hungarian matches, with mitosis check on each ---
+    average_flow = np.zeros_like(green_images[0], dtype=np.float32)
+    
+    # Parallel computation of optical flow for all frames
+    with mp.Pool(mp.cpu_count()) as pool:
+        flows = pool.starmap(compute_optical_flow, [(green_images[i], green_images[i + 1]) for i in range(len(images) - 1)])
+    
+    for i_images, flow in enumerate(flows):
+        flow_y, flow_x = flow
+        flow_x[flow_x < 0.05] = 0
+        flow_y[flow_y < 0.05] = 0
+        average_flow += np.sqrt(flow_x**2 + flow_y**2)
+        
+        h, w = flow_x.shape
+        flow_points = np.array([
+            [
+                x + flow_x[min(max(int(y), 0), h - 1), min(max(int(x), 0), w - 1)],
+                y + flow_y[min(max(int(y), 0), h - 1), min(max(int(x), 0), w - 1)]
+            ]
+            for x, y in current_points
+        ])
+        
+        calculated_edges = all_points[i_images + 1]
+        
+        matches, unmatched_points = hungarian_assignment(flow_points, calculated_edges, max_distance=max_distance)
+        
         for i_dict_list, entry in enumerate(dict_list):
             if not entry["Active"]:
                 continue
-
-            if np.array_equal(matches[i_dict_list], [-1, -1]):
-                continue  # handled below as "lost"
-
-            matched_point = matches[i_dict_list]
-            lbl_next = coord_to_label_next.get(
-                (float(matched_point[0]), float(matched_point[1]))
-            )
-
-            # ---- Mitosis check -------------------------------------------------
-            split_info = _detect_mitosis_split(
-                parent_entry=entry,
-                t_prev=t_prev,
-                t_next=t_next,
-                matched_point=matched_point,
-                matched_label=lbl_next,
-                unmatched_list=unmatched_list,
-                consumed_unmatched=consumed_unmatched,
-                coord_to_label_next=coord_to_label_next,
-                labeled_masks=labeled_masks,
-                mitosis_distance=mitosis_distance,
-                mitosis_area_ratio=mitosis_area_ratio,
-                mitosis_pair_area_ratio=mitosis_pair_area_ratio,
-            )
-
-            if split_info is not None:
-                d1_pt, d1_lbl, d2_pt, d2_lbl = split_info
-
-                # Close out the parent at t_prev (do NOT extend its path to t_next).
-                entry["Active"] = False
-                entry["EndReason"] = "mitosis"
-
-                # Spawn two daughters at t_next.
-                for d_pt, d_lbl in ((d1_pt, d1_lbl), (d2_pt, d2_lbl)):
-                    new_id = len(dict_list)
-                    dict_list.append({
-                        "Path": [np.array(d_pt)],
-                        "AverageDir": [0, 0],
-                        "StartIndex": t_next,
-                        "Active": True,
-                        "ID": new_id,
-                        "MaskLabels": [d_lbl],
-                        "ParentID": entry["ID"],
-                        "EndReason": None,
-                        "DaughterIDs": [],
-                    })
-                    entry["DaughterIDs"].append(new_id)
-                    if d_lbl is not None:
-                        tracked_mask[t_next][labeled_masks[t_next] == d_lbl] = new_id + 1
-
-                # Mark both detections as consumed so the unmatched-spawn pass skips them.
-                consumed_unmatched.add(tuple(map(float, d1_pt)))
-                consumed_unmatched.add(tuple(map(float, d2_pt)))
-                continue
-            # -------------------------------------------------------------------
-
-            # Normal (non-mitotic) continuation.
-            entry["Path"].append(matched_point)
-            entry["MaskLabels"].append(lbl_next)
-            if lbl_next is not None:
-                tracked_mask[t_next][labeled_masks[t_next] == lbl_next] = entry["ID"] + 1
-            if len(entry["Path"]) > 1:
-                _, _, avg_dir = average_direction(np.array(entry["Path"]))
-                entry["AverageDir"] = avg_dir
-
-        # --- Pass 2: spawn brand-new tracks for genuinely unmatched detections ---
-        for point in unmatched_points:
-            key = tuple(map(float, point))
-            if key in consumed_unmatched:
-                continue
-            lbl_next = coord_to_label_next.get(key)
-            new_id = len(dict_list)
+            
+            if not np.array_equal(matches[i_dict_list], [-1, -1]):
+                entry["Path"].append(matches[i_dict_list])
+                
+                curr_mask = find_current_mask(point = matches[i_dict_list], mask = labeled_mask_list[i_images])
+                entry["Mask"].append(curr_mask)
+                
+                if len(entry["Path"]) > 1:
+                    _, _, avg_dir = average_direction(np.array(entry["Path"]))
+                    entry["AverageDir"] = avg_dir
+                    
+        for idx, point in enumerate(unmatched_points):
+            curr_mask = find_current_mask(point= point, mask = labeled_mask_list[i_images])
+                
             dict_list.append({
                 "Path": [point],
                 "AverageDir": [0, 0],
-                "StartIndex": t_next,
+                "StartIndex": i_images,
                 "Active": True,
-                "ID": new_id,
-                "MaskLabels": [lbl_next],
-                "ParentID": None,
-                "EndReason": None,
-                "DaughterIDs": [],
+                "ID": len(dict_list)+idx,
+                "Mask": [curr_mask]
             })
-            if lbl_next is not None:
-                tracked_mask[t_next][labeled_masks[t_next] == lbl_next] = new_id + 1
-
-        # Rebuild current_points aligned with dict_list order.
+            
         current_points = np.array([entry["Path"][-1] for entry in dict_list])
-
-    return dict_list, tracked_mask
-
-def _detect_mitosis_split(
-    parent_entry,
-    t_prev,
-    t_next,
-    matched_point,
-    matched_label,
-    unmatched_list,
-    consumed_unmatched,
-    coord_to_label_next,
-    labeled_masks,
-    mitosis_distance,
-    mitosis_area_ratio,
-    mitosis_pair_area_ratio,
-):
-    """
-    Decide whether parent_entry undergoes mitosis at t_next.
-
-    Returns (daughter1_pt, daughter1_lbl, daughter2_pt, daughter2_lbl) on a
-    confirmed split, otherwise None.
-    """
-    if matched_label is None:
-        return None
-
-    parent_last_pt = np.asarray(parent_entry["Path"][-1], dtype=float)
-    matched_pt = np.asarray(matched_point, dtype=float)
-
-    # Parent's mask area from the previous frame (where we know its label).
-    parent_label_prev = parent_entry["MaskLabels"][-1]
-    if parent_label_prev is None:
-        return None
-    parent_area = int(np.sum(labeled_masks[t_prev] == parent_label_prev))
-    if parent_area <= 0:
-        return None
-
-    matched_area = int(np.sum(labeled_masks[t_next] == matched_label))
-
-    # Find the best second-daughter candidate among unmatched detections in t_next.
-    best = None  # (score, pt_tuple, label, area)
-    for cand_key in unmatched_list:
-        if cand_key in consumed_unmatched:
-            continue
-        cand_pt = np.asarray(cand_key, dtype=float)
-
-        # Both daughters should be near the parent's last position...
-        if np.linalg.norm(cand_pt - parent_last_pt) > mitosis_distance:
-            continue
-        # ...and near each other (daughters are typically adjacent post-division).
-        if np.linalg.norm(cand_pt - matched_pt) > mitosis_distance:
-            continue
-
-        cand_label = coord_to_label_next.get(cand_key)
-        if cand_label is None:
-            continue
-        cand_area = int(np.sum(labeled_masks[t_next] == cand_label))
-        if cand_area <= 0:
-            continue
-
-        # Area sanity: each daughter should be a reasonable fraction of the parent,
-        # and combined area shouldn't blow up.
-        if matched_area < mitosis_area_ratio * parent_area:
-            # matched detection alone too small relative to parent → still ok
-            pass
-        if cand_area < mitosis_area_ratio * 0.5 * parent_area:
-            # very small fragment — likely noise, skip
-            continue
-        if (matched_area + cand_area) > mitosis_pair_area_ratio * parent_area:
-            continue
-        if (matched_area + cand_area) < mitosis_area_ratio * parent_area:
-            # combined too small to plausibly be the parent splitting
-            continue
-
-        # Score: prefer pairs whose midpoint is closest to parent_last_pt and
-        # whose areas are balanced.
-        midpoint = 0.5 * (cand_pt + matched_pt)
-        center_err = np.linalg.norm(midpoint - parent_last_pt)
-        balance_err = abs(matched_area - cand_area) / float(matched_area + cand_area)
-        score = center_err + 10.0 * balance_err  # weight balance modestly
-
-        if best is None or score < best[0]:
-            best = (score, cand_key, cand_label, cand_area)
-
-    if best is None:
-        return None
-
-    _, cand_key, cand_label, _ = best
-    return (matched_pt, matched_label, np.array(cand_key), cand_label)
+    
+    return dict_list, average_flow
 
 def find_closest_points(points_A, points_B, max_distance=10):
     distances = np.linalg.norm(points_A[:, None, :] - points_B[None, :, :], axis=2)
@@ -1285,6 +804,7 @@ def median_denoise_single_image(image_data, size):
 def log_transform_single_image(image_data):
     i, image = image_data
     
+    # Compute the unsharp mask on the green channel
     c = 255 / np.log(1 + np.max(image[..., IMAGE_CHANNEL]))
     log_image = c * (np.log(image[..., IMAGE_CHANNEL] + 1))
     
@@ -1305,11 +825,13 @@ def bm3d_denoise_single_image(image_data):
     return result
 
 def wavelet_denoise_single_image(image_data):
+    i, image = image_data
+
     # Compute the unsharp mask on the green channel
-    image_est = skimage.restoration.denoise_wavelet(image_data[..., IMAGE_CHANNEL]);
+    image_est = skimage.restoration.denoise_wavelet(image[..., IMAGE_CHANNEL]);
     
-    result = image_data.copy()
-    result[..., IMAGE_CHANNEL] = np.array(image_est*255,dtype = np.uint8)
+    result = image.copy()
+    result[..., IMAGE_CHANNEL] = np.array(rescale_rgb_to_255(image_est, channel = None),dtype = np.uint8)
 
     return result
 
@@ -1373,7 +895,20 @@ def bm3d_denoise_all(images, max_workers=None):
     
     return denoised_images
 
-def wavelet_denoise_images_all(images):
-    """Apply wavelet denoising to a list of images."""
-    return [wavelet_denoise_single_image(img) for img in images]
+def wavelet_denoise_all(images, n_processes=None):
+    # If n_processes is not specified, use all available CPU cores
+    if n_processes is None:
+        n_processes = mp.cpu_count()
+    
+    # Create a pool of workers
+    with mp.Pool(processes=n_processes) as pool:
+        # Create a list of tuples (index, image) to pass to the worker function
+        image_data = [(i, img) for i, img in enumerate(images)]
 
+        # Use partial to create a function with fixed radius parameter
+        process_func = partial(wavelet_denoise_single_image)
+        
+        # Process images in parallel and gather results
+        results = pool.map(process_func, image_data)
+    
+    return results
