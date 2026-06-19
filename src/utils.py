@@ -11,9 +11,9 @@ from ctc_metrics import evaluate_sequence
 WORK_DIR = os.getcwd()
 PATH_OF_SRC_MODUL = WORK_DIR.replace("notebooks", "src")
 
-YOUR_DATA_PATH = r"\\sc-data.sc-store.charite.de\sc-project-cc06-agsack\noja11\CellTrack\Training\Dataset\PhC-C2DH-U373\01"
-MASK_PATH = r"\\sc-data.sc-store.charite.de\sc-project-cc06-agsack\noja11\CellTrack\Training\Dataset\PhC-C2DH-U373\01_GT\TRA"
-OUTPUT_PATH = r"E:\Project_CellTrack\PhC-C2DH-U373\01_RES_ws"
+YOUR_DATA_PATH = r""
+MASK_PATH = r""
+OUTPUT_PATH = r""
 
 IMAGE_CHANNEL = 1
 

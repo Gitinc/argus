@@ -15,9 +15,9 @@ import matplotlib as mpl
 WORK_DIR = os.getcwd()
 PATH_OF_SRC_MODUL = WORK_DIR.replace("notebooks", "src")
 
-YOUR_DATA_PATH = r"\\sc-data.sc-store.charite.de\sc-project-cc06-agsack\noja11\CellTrack\Training\Dataset\Fluo-C2DL-Huh7\01"
-OUTPUT_PATH = r"E:\Project_CellTrack\Fluo-C2DL-Huh7\01_RES_ws"   # scratch dir, overwritten every iteration
-RESULTS_CSV = r"E:\Project_CellTrack\Fluo-C2DL-Huh7\01_sweep_results.csv"
+YOUR_DATA_PATH = r""
+OUTPUT_PATH = r""   # scratch dir, overwritten every iteration
+RESULTS_CSV = r""
 IMAGE_CHANNEL = 1
 
 # =========================

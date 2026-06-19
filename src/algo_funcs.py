@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 IMAGE_CHANNEL = 0
 NO_MATCH = np.array([-1, -1])
 
-
 # ===========================================================================
 # I/O
 # ===========================================================================
@@ -35,13 +34,17 @@ def read_images(directory, is_gray_scale=False):
         images.append(img)
     return images
 
-
 def save_images(images, directory, pattern):
     os.makedirs(directory, exist_ok=True)
     for i in range(len(images)):
-        cv2.imwrite(os.path.join(directory, pattern + f"{i:03d}" + ".tif"),
-                    np.array(images[i], dtype=np.uint8))
+        if "*" in pattern:
+            filename = pattern.replace("*", f"{i:03d}")
+        else:
+            filename = pattern + f"{i:03d}"
+        filename += ".tif" if not filename.lower().endswith(".tif") else ""
 
+        img = Image.fromarray(np.array(images[i], dtype=np.uint8))
+        img.save(os.path.join(directory, filename))
 
 # ===========================================================================
 # Rescaling / clipping
@@ -78,11 +81,6 @@ def clip_images(images, clip_percentile=95):
         img = (img - img.min()) / (img.max() - img.min()) * 255
         images[i][..., IMAGE_CHANNEL] = img.astype(np.uint8)
     return images
-
-
-# ===========================================================================
-# Registration
-# ===========================================================================
 
 def image_registration(fixed_img, moving_img, registration_channel=-1, n_processes=None):
     if n_processes is None:
@@ -144,6 +142,28 @@ def subtract_mean_channel(images, axis=0):
         images[i][..., IMAGE_CHANNEL] = np.abs(images[i][..., IMAGE_CHANNEL] - mean_img)
     return images, mean_img
 
+def sliding_mean_subtraction(images, window=8):
+    images_array = np.array(images)
+    n = len(images)
+    result_means = []
+
+    after = window // 2
+    before = window - after  # gives the extra frame to "before" when window is odd
+
+    for i in range(n):
+        start = max(0, i - before)
+        end = min(n, i + after + 1)  # +1 because slicing is exclusive at the end
+
+        # Indices in the window, excluding the current frame i
+        idx = [j for j in range(start, end) if j != i]
+
+        window_slice = images_array[idx, ..., IMAGE_CHANNEL]
+        local_mean = np.mean(window_slice, axis=0)
+        result_means.append(local_mean)
+
+        images[i][..., IMAGE_CHANNEL] = np.abs(images[i][..., IMAGE_CHANNEL] - local_mean)
+
+    return images, result_means
 
 # ===========================================================================
 # Denoising / enhancement (per-image worker + parallel driver)
@@ -155,35 +175,29 @@ def unsharp_mask(image, sigma=1.0, alpha=1.5):
     return image + alpha * (image - blurred)  # high-boost filtering
 
 
-def unsharp_single_image(image_data, radius, amount):
-    i, image = image_data
-
+def unsharp_single_image(image, radius, amount):
     unsharp_masked = unsharp_mask(image[..., IMAGE_CHANNEL], sigma=radius, alpha=amount)
     unsharp_masked[unsharp_masked < np.std(unsharp_masked)] = 0
     binary_mask = unsharp_masked > 0
 
     binary_mask = scipy.ndimage.binary_closing(binary_mask, iterations=1)
-    binary_mask = skimage.morphology.remove_small_objects(binary_mask, min_size=6)
+    binary_mask = skimage.morphology.remove_small_objects(binary_mask, max_size=6)
 
     result = image.copy()
     result[..., IMAGE_CHANNEL] = unsharp_masked * binary_mask
     return result
 
 
-def median_denoise_single_image(image_data, size):
-    i, image = image_data
+def median_denoise_single_image(image, size):
+    image[..., IMAGE_CHANNEL] = scipy.ndimage.median_filter(image[..., IMAGE_CHANNEL], size=size)
+    return image
+
+def log_transform_single_image(image):
+    channel = image[..., IMAGE_CHANNEL].astype(np.float64)
+    c = 255 / np.log(1 + np.max(channel))
     result = image.copy()
-    result[..., IMAGE_CHANNEL] = scipy.ndimage.median_filter(image[..., IMAGE_CHANNEL], size=size)
+    result[..., IMAGE_CHANNEL] = np.clip(c * np.log(channel + 1), 0, 255).astype(np.uint8)
     return result
-
-
-def log_transform_single_image(image_data):
-    i, image = image_data
-    c = 255 / np.log(1 + np.max(image[..., IMAGE_CHANNEL]))
-    result = image.copy()
-    result[..., IMAGE_CHANNEL] = c * (np.log(image[..., IMAGE_CHANNEL] + 1))
-    return result
-
 
 def bm3d_denoise_single_image(image_data):
     noise_std = np.std(image_data)
@@ -193,45 +207,74 @@ def bm3d_denoise_single_image(image_data):
 
 
 def wavelet_denoise_single_image(image_data):
-    image_est = skimage.restoration.denoise_wavelet(image_data[..., IMAGE_CHANNEL])
+    image_est = skimage.restoration.denoise_wavelet(image_data[..., IMAGE_CHANNEL], wavelet='db2')
     result = image_data.copy()
     result[..., IMAGE_CHANNEL] = np.array(image_est * 255, dtype=np.uint8)
     return result
 
+def unsharp_mask_all(images, radius=8, amount=20, n_workers=None, backend="thread"):
+    n_workers = n_workers or os.cpu_count()
+    if backend == "thread":
+        Executor = ThreadPoolExecutor
+    elif backend == "process":
+        Executor = ProcessPoolExecutor
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
 
-def unsharp_mask_all(images, radius=8, amount=20, n_processes=None):
-    n_processes = n_processes or mp.cpu_count()
-    with mp.Pool(processes=n_processes) as pool:
-        image_data = [(i, img) for i, img in enumerate(images)]
-        process_func = partial(unsharp_single_image, radius=radius, amount=amount)
-        return pool.map(process_func, image_data)
+    worker = partial(unsharp_single_image, radius=radius, amount=amount)
 
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(worker, images))
+    
+def median_denoise_all(images, size, n_workers=None, backend="thread"):
+    n_workers = n_workers or os.cpu_count()
+    if backend == "thread":
+        Executor = ThreadPoolExecutor
+    elif backend == "process":
+        Executor = ProcessPoolExecutor
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
+    
+    worker = partial(median_denoise_single_image, size=size)
 
-def median_denoise_all(images, size, n_processes=None):
-    n_processes = n_processes or mp.cpu_count()
-    with mp.Pool(processes=n_processes) as pool:
-        image_data = [(i, img) for i, img in enumerate(images)]
-        process_func = partial(median_denoise_single_image, size=size)
-        return pool.map(process_func, image_data)
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(worker, images))
 
+def log_transform_all(images, n_workers=None, backend="thread"):
+    n_workers = n_workers or os.cpu_count()
+    if backend == "thread":
+        Executor = ThreadPoolExecutor
+    elif backend == "process":
+        Executor = ProcessPoolExecutor
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
 
-def log_transform_all(images, n_processes=None):
-    n_processes = n_processes or mp.cpu_count()
-    with mp.Pool(processes=n_processes) as pool:
-        image_data = [(i, img) for i, img in enumerate(images)]
-        return pool.map(log_transform_single_image, image_data)
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(log_transform_single_image, images))
 
+def wavelet_denoise_images_all(images, n_workers=None, backend="thread"):
+    n_workers = n_workers or os.cpu_count()
+    if backend == "thread":
+        Executor = ThreadPoolExecutor
+    elif backend == "process":
+        Executor = ProcessPoolExecutor
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
 
-def bm3d_denoise_all(images, max_workers=None):
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(bm3d_denoise_single_image, images))
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(wavelet_denoise_single_image, images))
 
+def bm3d_denoise_all(images, n_workers=None, backend="thread"):
+    n_workers = n_workers or os.cpu_count()
+    if backend == "thread":
+        Executor = ThreadPoolExecutor
+    elif backend == "process":
+        Executor = ProcessPoolExecutor
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
 
-def wavelet_denoise_images_all(images):
-    """Apply wavelet denoising to a list of images."""
-    return [wavelet_denoise_single_image(img) for img in images]
-
-
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(bm3d_denoise_single_image, images))
 # ===========================================================================
 # Monogenic enhancement (log-Gabor local energy)
 # ===========================================================================
@@ -303,7 +346,6 @@ def monogenic_filter_single_image(image_data, cw=60, sigma_onf=0.05, sigma_smoot
     result[..., IMAGE_CHANNEL] = rescale_to_uint8(image_est)
     return result
 
-
 def monogenic_filter_images(images, n_workers=None, backend="thread"):
     n_workers = n_workers or os.cpu_count()
 
@@ -325,7 +367,7 @@ def monogenic_filter_images(images, n_workers=None, backend="thread"):
 def detect_centers(image, cell_size, min_distance, manual_threshold=-1):
     thresh = skimage.filters.threshold_otsu(image) if manual_threshold == -1 else manual_threshold
     thresh_img = image > thresh
-    thresh_img = skimage.morphology.remove_small_objects(thresh_img, min_size=cell_size)
+    thresh_img = skimage.morphology.remove_small_objects(thresh_img, max_size=cell_size)
 
     labeled_mask = skimage.measure.label(thresh_img)
     centers = []  # ((y, x), area, original_label)
@@ -389,7 +431,7 @@ def locate_all_cells_centroids(images, cell_size, min_distance, manual_threshold
 def locate_cells(image, min_size=10, expected_mask_size=15, min_distance=10, manual_threshold=-1):
     thresh = skimage.filters.threshold_otsu(image) if manual_threshold == -1 else manual_threshold
     thresh_img = image > thresh
-    thresh_img = skimage.morphology.remove_small_objects(thresh_img, min_size=min_size)
+    thresh_img = skimage.morphology.remove_small_objects(thresh_img, max_size=min_size)
 
     labeled_mask = skimage.measure.label(thresh_img)
     result_coords = []
@@ -531,7 +573,7 @@ def process_single_image_mask(image, T, cw_monogenic):
 def locate_cells_monogenic_filter(image, thresh_img, min_distance=5):
     binary_mask_dilated = thresh_img > 0
     labeled_mask, num_features = skimage.measure.label(binary_mask_dilated, return_num=True)
-    labeled_mask = skimage.morphology.remove_small_objects(labeled_mask, min_size=2)
+    labeled_mask = skimage.morphology.remove_small_objects(labeled_mask, max_size=2)
 
     all_maxima = []
     for region_id in range(1, num_features + 1):
