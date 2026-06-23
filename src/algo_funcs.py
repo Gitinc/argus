@@ -177,14 +177,14 @@ def unsharp_mask(image, sigma=1.0, alpha=1.5):
 
 def unsharp_single_image(image, radius, amount):
     unsharp_masked = unsharp_mask(image[..., IMAGE_CHANNEL], sigma=radius, alpha=amount)
-    unsharp_masked[unsharp_masked < np.std(unsharp_masked)] = 0
-    binary_mask = unsharp_masked > 0
+    #unsharp_masked[unsharp_masked < np.std(unsharp_masked)] = 0
+    #binary_mask = unsharp_masked > 0
 
-    binary_mask = scipy.ndimage.binary_closing(binary_mask, iterations=1)
-    binary_mask = skimage.morphology.remove_small_objects(binary_mask, max_size=6)
+    #binary_mask = scipy.ndimage.binary_closing(binary_mask, iterations=1)
+    #binary_mask = skimage.morphology.remove_small_objects(binary_mask, max_size=6)
 
     result = image.copy()
-    result[..., IMAGE_CHANNEL] = unsharp_masked * binary_mask
+    result[..., IMAGE_CHANNEL] = unsharp_masked
     return result
 
 
@@ -326,7 +326,7 @@ def local_energy(m1, m2, m3):
     return m1**2 + m2**2 + m3**2
 
 
-def monogenic_filter_single_image(image_data, cw=60, sigma_onf=0.05, sigma_smooth=8):
+def monogenic_filter_single_image(image_data, cw, sigma_onf, sigma_smooth):
     image_ch = image_data[..., IMAGE_CHANNEL]
     result = image_data.copy()
     Y, X = image_ch.shape
@@ -346,7 +346,7 @@ def monogenic_filter_single_image(image_data, cw=60, sigma_onf=0.05, sigma_smoot
     result[..., IMAGE_CHANNEL] = rescale_to_uint8(image_est)
     return result
 
-def monogenic_filter_images(images, n_workers=None, backend="thread"):
+def monogenic_filter_images(images, cw=60, sigma_onf=0.05, sigma_smooth=8, n_workers=None, backend="thread"):
     n_workers = n_workers or os.cpu_count()
 
     if backend == "thread":
@@ -356,9 +356,71 @@ def monogenic_filter_images(images, n_workers=None, backend="thread"):
     else:
         raise ValueError(f"Unknown backend: {backend!r}")
 
-    with Executor(max_workers=n_workers) as ex:
-        return list(ex.map(monogenic_filter_single_image, images))
+    worker = partial(monogenic_filter_single_image, cw=cw, sigma_onf=sigma_onf, sigma_smooth=sigma_smooth)
 
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(worker, images))
+
+def detect_centers_voronoi_otsu(image, spot_sigma=2, outline_sigma=2):
+    image = image.astype(np.float64)
+
+    # --- Voronoi-Otsu-Labeling segmentation step ---
+    blurred_spots = skimage.filters.gaussian(image, sigma=spot_sigma, preserve_range=True)
+    blurred_outline = skimage.filters.gaussian(image, sigma=outline_sigma, preserve_range=True)
+
+    thresh = skimage.filters.threshold_otsu(blurred_outline)
+    binary = blurred_outline > thresh
+
+    coords = skimage.feature.peak_local_max(
+        blurred_spots,
+        min_distance=1,
+        labels=binary.astype(int),
+    )
+
+    if len(coords) == 0:
+        labeled_mask = np.zeros(image.shape, dtype=np.int32)
+    else:
+        yy, xx = np.indices(image.shape)
+        tree = scipy.spatial.cKDTree(coords)
+        _, nearest_seed_idx = tree.query(np.stack([yy.ravel(), xx.ravel()], axis=1))
+        voronoi_labels = (nearest_seed_idx + 1).reshape(image.shape)
+        labeled_mask = np.where(binary, voronoi_labels, 0).astype(np.int32)
+
+    # --- centroid extraction + relabeling (no area sort, no distance filter) ---
+    out_mask = np.zeros_like(labeled_mask, dtype=np.int32)
+    kept_points = []
+    centroid_label_pairs = []
+    for new_label, region in enumerate(skimage.measure.regionprops(labeled_mask), start=1):
+        y, x = region.centroid
+        cy, cx = int(round(y)), int(round(x))
+        out_mask[labeled_mask == region.label] = new_label
+        kept_points.append((cy, cx))
+        centroid_label_pairs.append(((cy, cx), new_label))
+
+    return np.array(kept_points, dtype=int), out_mask, centroid_label_pairs
+
+
+def locate_all_cells_centroids_voronoi_otsu(images, spot_sigma=2, outline_sigma=2):
+    """
+    Drop-in replacement for locate_all_cells_centroids(), using
+    detect_centers_voronoi_otsu() per frame. Same (x, y) swap and
+    output structure as the original.
+    """
+    edges_list, mask_list, labels_list = [], [], []
+    for image in images:
+        edges, mask, centroid_label_pairs = detect_centers_voronoi_otsu(
+            image[:, :, IMAGE_CHANNEL],
+            spot_sigma=spot_sigma,
+            outline_sigma=outline_sigma,
+        )
+        # Swap (y, x) -> (x, y); centroid_label_pairs is in the SAME order as edges.
+        edges_copy = edges.copy()
+        edges[:, 0], edges[:, 1] = edges_copy[:, 1], edges_copy[:, 0]
+        labels = np.array([lbl for (_pt, lbl) in centroid_label_pairs], dtype=np.int32)
+        edges_list.append(edges)
+        mask_list.append(mask)
+        labels_list.append(labels)
+    return edges_list, mask_list, labels_list
 
 # ===========================================================================
 # Cell detection: centroids
