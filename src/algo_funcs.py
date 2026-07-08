@@ -46,6 +46,25 @@ def save_images(images, directory, pattern):
         img = Image.fromarray(np.array(images[i], dtype=np.uint8))
         img.save(os.path.join(directory, filename))
 
+def save_label_images(images, directory, pattern):
+    os.makedirs(directory, exist_ok=True)
+    for i in range(len(images)):
+        if "*" in pattern:
+            filename = pattern.replace("*", f"{i:03d}")
+        else:
+            filename = pattern + f"{i:03d}"
+        filename += ".tif" if not filename.lower().endswith(".tif") else ""
+
+        frame = np.asarray(images[i])
+        # label images: keep IDs intact (uint16 up to 65535, else int32)
+        if frame.max() <= 65535:
+            frame = frame.astype(np.uint16)
+        else:
+            frame = frame.astype(np.int32)
+
+        img = Image.fromarray(np.array(frame, dtype=np.uint8))
+        img.save(os.path.join(directory, filename))
+
 # ===========================================================================
 # Rescaling / clipping
 # ===========================================================================
@@ -187,6 +206,28 @@ def unsharp_single_image(image, radius, amount):
     result[..., IMAGE_CHANNEL] = unsharp_masked
     return result
 
+def gaussian_psf(size, sigma):
+    """2D Gaussian approximation of the PSF, unit-normalized."""
+    ax = np.arange(size) - (size - 1) / 2
+    xx, yy = np.meshgrid(ax, ax)
+    psf = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    return psf / psf.sum()
+
+def psf_ncc(image, sigma=1.5):
+    img = image.astype(np.float32)[..., IMAGE_CHANNEL]
+    template_size = int(2 * np.ceil(3 * sigma) + 1)  # ~3-sigma support
+    psf = gaussian_psf(template_size, sigma).astype(np.float32)
+    pad = template_size // 2
+    img_p = np.pad(img, pad, mode='reflect')
+
+    # valid mode: output shape == original image (H+2*pad - template + 1 == H)
+    ncc = skimage.feature.match_template(img_p, psf, pad_input=False)
+
+    ncc_u8 = (np.clip(ncc, 0.0, 1.0) * 255).round().astype(np.uint8)
+
+    result = image.copy()
+    result[..., IMAGE_CHANNEL] = ncc_u8
+    return result
 
 def median_denoise_single_image(image, size):
     image[..., IMAGE_CHANNEL] = scipy.ndimage.median_filter(image[..., IMAGE_CHANNEL], size=size)
@@ -212,6 +253,20 @@ def wavelet_denoise_single_image(image_data):
     result[..., IMAGE_CHANNEL] = np.array(image_est * 255, dtype=np.uint8)
     return result
 
+def psf_ncc_all(images, sigma=4, n_workers=None, backend="thread"):
+    n_workers = n_workers or os.cpu_count()
+    if backend == "thread":
+        Executor = ThreadPoolExecutor
+    elif backend == "process":
+        Executor = ProcessPoolExecutor
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}")
+
+    worker = partial(psf_ncc, sigma=sigma)
+
+    with Executor(max_workers=n_workers) as ex:
+        return list(ex.map(worker, images))
+    
 def unsharp_mask_all(images, radius=8, amount=20, n_workers=None, backend="thread"):
     n_workers = n_workers or os.cpu_count()
     if backend == "thread":
@@ -399,15 +454,10 @@ def detect_centers_voronoi_otsu(image, spot_sigma=2, outline_sigma=2):
 
     return np.array(kept_points, dtype=int), out_mask, centroid_label_pairs
 
-
 def locate_all_cells_centroids_voronoi_otsu(images, spot_sigma=2, outline_sigma=2):
-    """
-    Drop-in replacement for locate_all_cells_centroids(), using
-    detect_centers_voronoi_otsu() per frame. Same (x, y) swap and
-    output structure as the original.
-    """
     edges_list, mask_list, labels_list = [], [], []
-    for image in images:
+    for i, image in enumerate(images):
+        print("Working on image:", i)
         edges, mask, centroid_label_pairs = detect_centers_voronoi_otsu(
             image[:, :, IMAGE_CHANNEL],
             spot_sigma=spot_sigma,
@@ -421,7 +471,6 @@ def locate_all_cells_centroids_voronoi_otsu(images, spot_sigma=2, outline_sigma=
         mask_list.append(mask)
         labels_list.append(labels)
     return edges_list, mask_list, labels_list
-
 # ===========================================================================
 # Cell detection: centroids
 # ===========================================================================
@@ -917,6 +966,64 @@ def _split_parent_into_daughters(parent, daughter_a, daughter_b, frame_idx,
     parent["Children"] = [a_id, b_id]
     parent["DaughterIDs"] = [a_id, b_id]
 
+def track_points_optical_flow_simple(images, all_points, all_labels, labeled_masks,
+                              max_distance):
+    # --- Setup ---
+    green = [img[:, :, IMAGE_CHANNEL] if img.ndim == 3 else img for img in images]
+    T, H, W = len(labeled_masks), *labeled_masks[0].shape
+    tracked_mask = np.zeros((T, H, W), dtype=np.int32)
+    average_flow = np.zeros((H, W), dtype=np.float32)
+    dict_list = []
+
+    # Seed tracks from frame 0.
+    for point, label in zip(all_points[0], all_labels[0]):
+        _spawn_track(dict_list, tracked_mask, labeled_masks[0], frame_idx=0, point=point, label=int(label))
+
+    flows = _compute_flows_parallel(green)
+
+    # --- Main loop: propagate tracks frame by frame ---
+    for t, (flow_y, flow_x) in enumerate(flows):
+        t_next = t + 1
+        print(f"Working on image: {t}")
+
+        flow_x, flow_y = _threshold_small_flow(flow_x, flow_y)
+        average_flow += np.hypot(flow_x, flow_y)
+
+        active_indices = [i for i, e in enumerate(dict_list) if e["Active"]]
+        if not active_indices:
+            # no active tracks: still spawn from this frame's detections
+            for point in all_points[t_next]:
+                _spawn_track(dict_list, tracked_mask, labeled_masks[t_next],
+                             frame_idx=t_next, point=point,
+                             label=_build_label_lookup(all_points[t_next], all_labels[t_next]).get(_round_key(point)))
+            continue
+
+        # 1. Predict where each active track lands in t_next.
+        current_points = np.array([_current_position(dict_list[i]) for i in active_indices])
+        predicted = _advect_points(current_points, flow_x, flow_y)
+
+        # 2. Match predictions to detections.
+        detected = all_points[t_next]
+        matches, unmatched_points = hungarian_assignment(predicted, detected, max_distance=max_distance)
+        label_lookup = _build_label_lookup(detected, all_labels[t_next])
+        label_of = lambda point: label_lookup.get(_round_key(point))
+
+        # 3. Extend matched tracks; terminate unmatched ones.
+        for k, entry_idx in enumerate(active_indices):
+            entry = dict_list[entry_idx]
+            match = matches[k]
+            if _is_no_match(match):
+                entry["Active"] = False          # terminate instead of occluding
+            else:
+                _extend_track(entry, match, label_of(match), t_next, tracked_mask, labeled_masks[t_next])
+
+        # 4. Spawn new tracks from any leftover unmatched detections.
+        for point in unmatched_points:
+            _spawn_track(dict_list, tracked_mask, labeled_masks[t_next],
+                         frame_idx=t_next, point=point, label=label_of(point))
+
+    # `flows` is returned so refinement can reuse it instead of recomputing.
+    return dict_list, average_flow, tracked_mask, flows
 
 # ===========================================================================
 # Main tracker (optical flow)
